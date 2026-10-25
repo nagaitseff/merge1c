@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 import uuid
 
@@ -43,6 +45,19 @@ def check_location(location: Path, forbidden_roots) -> None:
             raise StorageError(f"Сессия должна быть отдельно от исходников: {location}. Выберите соседний каталог в storage.session_root или --session")
 
 
+@contextmanager
+def _probe_directory(root: Path):
+    # tempfile.mkdtemp retries PermissionError on Windows when os.access()
+    # reports write access. That is not reliable for a CreateDirectories ACL.
+    # A UUID name plus one exclusive mkdir reports the actual denial at once.
+    scratch = root / f".merge1c-check-{uuid.uuid4().hex}"
+    scratch.mkdir(mode=0o700)
+    try:
+        yield scratch
+    finally:
+        shutil.rmtree(scratch)
+
+
 def check_storage(directory: str | Path, *, forbidden_roots=()) -> Path:
     """Probe in an owned scratch directory; never chmod or edit existing files."""
     root = Path(directory).resolve()
@@ -54,8 +69,7 @@ def check_storage(directory: str | Path, *, forbidden_roots=()) -> Path:
     try:
         root.mkdir(parents=True, exist_ok=True)
         operation = "создать временный подкаталог"
-        with tempfile.TemporaryDirectory(prefix=".merge1c-check-", dir=root) as scratch:
-            work = Path(scratch)
+        with _probe_directory(root) as work:
             original, renamed = work / "before", work / "after"
             original.mkdir()
             item = original / "test.bin"

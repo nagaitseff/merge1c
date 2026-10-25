@@ -112,6 +112,28 @@ class CliTests(unittest.TestCase):
                 self.assertTrue(stderr.strip())
                 self.assertNotIn("Traceback", stderr)
 
+    def test_write_example_recovers_from_broken_config_without_overwriting_files(self):
+        broken = self.config_file("[storage]\nsession_root = C:/Temp\n")
+        original = broken.read_bytes()
+        example = self.root / "Подсказки с пробелами" / "settings.toml"
+        code, stdout, stderr = self.cli("config", "--config", broken, "--write-example", example)
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(original, broken.read_bytes())
+        self.assertIn("session_root", example.read_text(encoding="utf-8"))
+        code, stdout, stderr = self.cli("config", "--config", example)
+        self.assertEqual(0, code, stderr)
+        self.assertEqual("", json.loads(stdout)["config"]["session_root"])
+        generated = example.read_bytes()
+        code, stdout, stderr = self.cli("config", "--config", broken, "--write-example", example)
+        self.assertEqual(2, code)
+        self.assertEqual("", stdout)
+        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(generated, example.read_bytes())
+        code, stdout, stderr = self.cli("config", "--config", broken, "--write-example", broken)
+        self.assertEqual(2, code)
+        self.assertEqual(original, broken.read_bytes())
+        self.assertNotIn("Traceback", stderr)
+
     @unittest.skipUnless(shutil.which("git"), "Git executable is required for doctor")
     def test_doctor_reports_a_missing_required_tool_without_launching_gui(self):
         config = self.config_file('''[validation]

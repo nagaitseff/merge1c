@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 build/
 .venv/
+.venv-build/
 merge1c.local.toml
 .merge1c/
 .ruff_cache/

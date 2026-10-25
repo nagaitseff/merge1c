@@ -289,7 +289,7 @@ class RepositorySessionTests(unittest.TestCase):
                         required_validators=("check",), tools={"check": tool})
         with patch("tempfile.gettempdir", side_effect=PermissionError("system temp is unavailable")):
             session = prepare_repository(self.repo, "vendor", config=config)
-            self.assertEqual(session.path.parent, storage)
+            self.assertEqual(session.path.parent, storage.resolve())
             self.assertTrue(session.check(run_tools=True)["ready"])
             commit = session.create_branch("candidate/custom-storage")
         self.assertEqual(self.git("rev-parse", "candidate/custom-storage").decode().strip(), commit)

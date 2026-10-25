@@ -66,6 +66,24 @@ class WorkspaceTests(unittest.TestCase):
             with self.assertRaisesRegex(StorageError, "создать каталог хранения"):
                 check_storage(self.root / "denied")
 
+    def test_child_directory_denial_is_reported_without_tempfile_retries(self):
+        directory = self.root / "storage"
+        directory.mkdir()
+        original = Path.mkdir
+        attempts = []
+
+        def create(path, *args, **kwargs):
+            if path.name.startswith(".merge1c-check-"):
+                attempts.append(path)
+                raise PermissionError("CreateDirectories denied despite os.access write access")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", create), patch("os.access", return_value=True):
+            with self.assertRaisesRegex(StorageError, "создать временный подкаталог"):
+                check_storage(directory)
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(list(directory.iterdir()), [])
+
     def test_inside_source_is_rejected_before_any_write(self):
         source = self.root / "repository"
         source.mkdir()

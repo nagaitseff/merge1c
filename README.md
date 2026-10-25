@@ -6,14 +6,17 @@ Python-библиотека и консольная программа для о
 
 ## Установка
 
-Нужны Python 3.11+ и Git 2.50+. Если библиотека находится в `C:/i-merge/merge1c`, выполните в cmd или PowerShell:
+Готовая поставка находится в `dist`. Нужен Git 2.50+. Выберите один способ запуска:
+
+- **Без установки Python:** распакуйте `merge1c-0.1.2-windows-x64.zip` в доступную папку. Запускайте `merge1c.exe` из неё или добавьте эту папку в PATH. Каталог `_internal` должен оставаться рядом с exe. Уже распакованная поставка: `dist/merge1c-0.1.2-windows-x64`.
+- **Как библиотека Python:** нужен Python 3.11+. Выполните в cmd или PowerShell:
 
 ```text
-python -m pip install "C:/i-merge/merge1c/dist/merge1c-0.1.2-py3-none-any.whl"
+python -m pip install --upgrade "C:/i-merge/merge1c/dist/merge1c-0.1.2-py3-none-any.whl"
 python -m merge1c --version
 ```
 
-При другом расположении укажите свой путь. Без готового wheel: `python -m pip install "C:/i-merge/merge1c"`. Добавление каталога в PATH не заменяет установку. Для запуска через `python -m merge1c` Scripts в PATH не требуется.
+При другом расположении укажите свой путь. Без готового wheel: `python -m pip install "C:/i-merge/merge1c"`. Для Python-варианта добавление каталога в PATH не заменяет установку; команда `python -m merge1c` работает без Scripts в PATH. Сборка из исходников описана в [разработке](docs/development.md#собрать-поставку).
 
 ## Документация
 

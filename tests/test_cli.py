@@ -252,6 +252,22 @@ executable = "merge1c-nonexistent-checker"
         self.assertEqual(json.loads(output.getvalue()), {"status": "already_integrated", "message": "Уже включено"})
         self.assertTrue(output.getvalue().isascii())
 
+    def test_configured_storage_allows_merge_without_session_argument(self):
+        directories = self.inputs()
+        storage = self.root / "Хранение сессий"
+        config = self.config_file(f"[storage]\nsession_root = '{storage.as_posix()}'\n[validation]\nrequire_platform = false\n")
+        code, stdout, stderr = self.cli("merge", *directories, "--config", config, "--quiet", "--json")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(Path(json.loads(stdout)["session"]).parent, storage)
+
+    def test_storage_only_doctor_checks_files_without_platform_or_git(self):
+        storage = self.root / "Work directory"
+        config = self.config_file(f"[storage]\nsession_root = '{storage.as_posix()}'\n[git]\nexecutable = 'not-installed-git'\n")
+        code, stdout, stderr = self.cli("doctor", "--config", config, "--storage-only")
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(str(storage), stdout)
+        self.assertEqual(list(storage.iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main()

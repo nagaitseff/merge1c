@@ -8,7 +8,7 @@ from .models import Change, Issue, MergeResult
 from .session import AlreadyIntegrated, Session, SessionError, prepare_directories, prepare_repository
 from .xmlmerge import inspect_xml, merge_xml
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
     "AlreadyIntegrated", "Change", "Config", "ConfigError", "DirectoryResult", "GitError", "Issue", "MergeError", "MergeResult",

@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import asdict
 import difflib
 import json
+from importlib.resources import files
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -18,56 +19,11 @@ from .engine import MergeError, validate_directory
 from .gitrepo import GitError, GitRepository
 from .processes import find_program
 from .session import AlreadyIntegrated, Session, SessionError, prepare_directories, prepare_repository
+from .workspace import check_location, check_storage, storage_root
 
 
-DEFAULT_CONFIG = '''schema_version = 1
-
-[project]
-# Пустой список означает проверку всего дерева исходников.
-source_roots = []
-platform_version = "8.3.27.2342"
-
-[git]
-minimum_version = "2.50.0"
-rename_detection = "domain"
-
-[xml.forms]
-preserve_source = true
-placement = "after_incoming_in_same_gap"
-id_policy = "preserve_and_remap_collisions"
-
-[bsl]
-mode = "conservative"
-preserve_source = true
-
-[resolution]
-ambiguous = "manual"
-manual_tool = "beyond_compare"
-
-[tools.beyond_compare]
-adapter = "beyond_compare"
-kind = "resolver"
-timeout = 7200
-
-[validation]
-require_platform = true
-required_tools = []
-
-[profiles.vendor_update]
-incoming_role = "vendor"
-
-[profiles.develop_sync]
-incoming_role = "master"
-'''
-
-LOCAL_EXAMPLE = r'''# Скопируйте файл в merge1c.local.toml и укажите установленные программы.
-# merge1c.local.toml не следует добавлять в Git.
-[git]
-executable = 'C:\Program Files\Git\cmd\git.exe'
-
-[tools.beyond_compare]
-executable = 'C:\Program Files\Beyond Compare 5\BCompare.exe'
-'''
+DEFAULT_CONFIG = files("merge1c").joinpath("templates/merge1c.toml").read_text(encoding="utf-8")
+LOCAL_EXAMPLE = files("merge1c").joinpath("templates/merge1c.local.example.toml").read_text(encoding="utf-8")
 
 
 def _config(arguments):
@@ -100,6 +56,10 @@ def _progress(json_lines: bool):
             if current == 1 or current == total or current % 100 == 0:
                 print(f"Объединение: {current}/{total} — {event['path']}", file=sys.stderr, flush=True)
         elif phase != last_phase:
+            if phase == "storage":
+                print(f"Каталог сессии: {event['session']}", file=sys.stderr, flush=True)
+                last_phase = phase
+                return
             message = {"scan": "Чтение исходников", "validate": "Проверка результата", "complete": "Кандидат подготовлен"}.get(phase, phase)
             print(message, file=sys.stderr, flush=True)
         last_phase = phase
@@ -139,16 +99,19 @@ def parser() -> argparse.ArgumentParser:
     commands = result.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init", help="Создать начальные настройки")
     init.add_argument("directory", nargs="?", default=".")
-    commands.add_parser("config", parents=[common], help="Показать итоговые настройки")
+    configuration = commands.add_parser("config", parents=[common], help="Показать итоговые настройки")
+    configuration.add_argument("--write-example", metavar="FILE", help="Сохранить образец со всеми пояснениями; существующий файл не заменяется")
     doctor = commands.add_parser("doctor", parents=[common], help="Проверить Git и наличие инструментов")
     doctor.add_argument("--repo")
+    doctor.add_argument("--session", help="Проверить доступ к конкретной сессии вместо storage.session_root")
+    doctor.add_argument("--storage-only", action="store_true", help="Проверить только каталог хранения, без Git и внешних программ")
     inspect = commands.add_parser("inspect", parents=[common], help="Проверить каталог исходников без объединения")
     inspect.add_argument("directory")
     inspect.add_argument("--json", action="store_true")
     merge = commands.add_parser("merge", parents=[common], help="Объединить три каталога в отдельную сессию")
     for side in ("base", "local", "incoming"):
         merge.add_argument(side)
-    merge.add_argument("--session", required=True)
+    merge.add_argument("--session", help="Новый каталог сессии; без параметра создаётся в storage.session_root")
     merge.add_argument("--json", action="store_true")
     merge_progress = merge.add_mutually_exclusive_group()
     merge_progress.add_argument("--json-progress", action="store_true")
@@ -156,7 +119,7 @@ def parser() -> argparse.ArgumentParser:
     prepare = commands.add_parser("prepare", parents=[common], help="Подготовить слияние текущего HEAD с веткой Git")
     prepare.add_argument("incoming")
     prepare.add_argument("--repo", default=".")
-    prepare.add_argument("--session", required=True)
+    prepare.add_argument("--session", help="Новый каталог сессии; без параметра создаётся в storage.session_root")
     prepare.add_argument("--json", action="store_true")
     prepare_progress = prepare.add_mutually_exclusive_group()
     prepare_progress.add_argument("--json-progress", action="store_true")
@@ -213,12 +176,37 @@ def main(argv: list[str] | None = None) -> int:
                     stream.write(content)
                 print(path)
             return 0
+        if arguments.command == "config" and arguments.write_example:
+            target = Path(arguments.write_example).resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("x", encoding="utf-8", newline="\n") as stream:
+                stream.write(DEFAULT_CONFIG)
+            print(f"Образец настроек: {target}")
+            return 0
         if arguments.command in {"config", "doctor", "inspect", "merge", "prepare", "git-preview"}:
             config = _config(arguments)
         if arguments.command == "config":
             print(json.dumps({"config": config.to_dict(), "sha256": config.fingerprint}, ensure_ascii=True, indent=2))
             return 0
         if arguments.command == "doctor":
+            forbidden = []
+            if arguments.repo:
+                source = Path(arguments.repo).resolve()
+                source = next((parent for parent in (source, *source.parents) if (parent / ".git").exists()), source)
+                forbidden.append(source)
+            if arguments.session:
+                location = Path(arguments.session).resolve()
+                check_location(location, forbidden)
+                if location.exists() and not location.is_dir():
+                    raise ConfigError(f"Путь сессии занят файлом: {location}")
+                directory = location if location.is_dir() else location.parent
+            else:
+                directory = storage_root(config)
+            checked = check_storage(directory, forbidden_roots=forbidden)
+            print(f"Каталог хранения: {checked}")
+            print("Создание, чтение, запись, замена, переименование и удаление: доступны")
+            if arguments.storage_only:
+                return 0
             command = find_program(config.git_executable)
             if not command:
                 raise ConfigError("Git не найден; задайте git.executable в локальных настройках")

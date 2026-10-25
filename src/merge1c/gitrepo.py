@@ -220,7 +220,7 @@ class GitRepository:
         stage = Path(tempfile.mkdtemp(prefix=".merge1c-export-", dir=target.parent))
         process = None
         try:
-            with tempfile.TemporaryFile() as errors:
+            with tempfile.TemporaryFile(dir=target.parent) as errors:
                 try:
                     process = subprocess.Popen(
                         self._command(["cat-file", "--batch"]), stdin=subprocess.PIPE,
@@ -263,7 +263,11 @@ class GitRepository:
                 target.rmdir()
             stage.rename(target)
         except (OSError, ValueError) as exc:
-            raise GitError("Cannot export tree: %s" % exc) from exc
+            raise GitError(
+                "Не удалось выгрузить снимок Git в %s: %s. "
+                "Проверьте права на создание, переименование и удаление каталогов, а также блокировку файлов. "
+                "Другой рабочий каталог задаётся через storage.session_root или --session" % (target, exc)
+            ) from exc
         finally:
             if process is not None:
                 if process.poll() is None:
@@ -392,11 +396,11 @@ class GitRepository:
         entries.sort(key=lambda entry: entry[0].encode("utf-8", errors="surrogateescape"))
         return entries
 
-    def _verify_captured_blobs(self, objects: list[tuple[str, bytes]], expected: dict[str, str]) -> None:
+    def _verify_captured_blobs(self, objects: list[tuple[str, bytes]], expected: dict[str, str], *, temporary_directory: Path) -> None:
         """Check immutable captured blobs, rather than rereading mutable files."""
         if not objects:
             return
-        with tempfile.TemporaryFile() as errors:
+        with tempfile.TemporaryFile(dir=temporary_directory) as errors:
             try:
                 process = subprocess.Popen(
                     self._command(["cat-file", "--batch"]), stdin=subprocess.PIPE,
@@ -499,8 +503,9 @@ class GitRepository:
                 mode = "100755" if after.st_mode & 0o111 else "100644"
             index_input.extend(mode.encode("ascii") + b" " + oid + b"\t" + name.encode("utf-8", errors="surrogateescape") + b"\0")
         if expected_hashes is not None:
-            self._verify_captured_blobs([(entry[0], oid) for entry, oid in zip(entries, hashes, strict=True)], expected_hashes)
-        with tempfile.TemporaryDirectory(prefix="merge1c-index-") as temporary:
+            self._verify_captured_blobs([(entry[0], oid) for entry, oid in zip(entries, hashes, strict=True)], expected_hashes,
+                                        temporary_directory=directory.parent)
+        with tempfile.TemporaryDirectory(prefix="merge1c-index-", dir=directory.parent) as temporary:
             env = {"GIT_INDEX_FILE": str(Path(temporary) / "index")}
             self._run(["read-tree", "--empty"], env=env)
             if index_input:

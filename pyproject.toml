@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "merge1c"
-version = "0.1.1"
+version = "0.1.2"
 description = "Three-way integration of 1C Designer XML and BSL sources"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,7 +26,7 @@ merge1c = "merge1c.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-merge1c = ["py.typed"]
+merge1c = ["py.typed", "templates/*.toml"]
 
 [tool.ruff]
 target-version = "py311"

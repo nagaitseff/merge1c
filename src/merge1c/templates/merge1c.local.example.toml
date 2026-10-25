@@ -1,0 +1,19 @@
+# Скопируйте этот файл в merge1c.local.toml рядом с merge1c.toml.
+# Локальный файл не добавляйте в Git: пути на разных компьютерах отличаются.
+# Здесь разрешены только storage.session_root и пути executable уже
+# объявленных инструментов. Правила и аргументы остаются в общем файле.
+
+[storage]
+# Куда складывать новые сессии без --session. Выберите доступный каталог,
+# например 'C:/Temp/merge-sessions' или 'C:/REP/merge-sessions'.
+# '' оставляет временный каталог пользователя. Нужны права создания,
+# чтения, записи, переименования и удаления. Репозиторий сюда не указывайте.
+session_root = ''
+
+[git]
+# Путь именно к git.exe. Исправьте, если Git установлен в другом месте.
+executable = 'C:/Program Files/Git/cmd/git.exe'
+
+[tools.beyond_compare]
+# Путь к установленному Beyond Compare. Версия и каталог могут отличаться.
+executable = 'C:/Program Files/Beyond Compare 5/BCompare.exe'

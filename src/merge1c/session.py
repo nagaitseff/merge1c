@@ -19,6 +19,7 @@ from .config import Config, config_from_snapshot
 from .engine import MergeError, file_hash, is_link_path, merge_directories, snapshot, validate_directory
 from .models import Issue
 from .tools import run_tool, tool_identity
+from .workspace import check_storage, session_location
 
 
 class SessionError(ValueError):
@@ -40,6 +41,8 @@ def _locked(method):
                 descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except FileExistsError as exc:
                 raise SessionError("Сессия занята другим процессом. После аварийного завершения используйте unlock --force") from exc
+            except PermissionError as exc:
+                raise SessionError(f"Нет права записи в сессию {self.path}. Проверьте доступ к каталогу; --force не исправляет права доступа") from exc
             try:
                 with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                     json.dump({"pid": os.getpid(), "started": _now()}, stream)
@@ -82,7 +85,12 @@ class Session:
             if self.data["schema_version"] != 1:
                 raise ValueError("неподдержанная версия сессии")
             self.config = config_from_snapshot(self.data["config"])
-            if self.config.fingerprint != self.data["config_hash"]:
+            expected = self.config.fingerprint
+            if "session_root" not in self.data["config"]:
+                legacy = self.config.to_dict()
+                del legacy["session_root"]
+                expected = sha256(json.dumps(legacy, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+            if expected != self.data["config_hash"]:
                 raise ValueError("изменён снимок настроек")
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise SessionError(f"Не удалось открыть сессию {self.path}: {exc}") from exc
@@ -302,17 +310,18 @@ class Session:
 
 
 def prepare_directories(
-    base: str | Path, local: str | Path, incoming: str | Path, session: str | Path,
+    base: str | Path, local: str | Path, incoming: str | Path, session: str | Path | None = None,
     *, config: Config | None = None, progress: Callable[[dict], None] | None = None,
 ) -> Session:
     config = config or Config()
-    location = Path(session).resolve()
+    location = session_location(config, session)
     roots = [Path(value).resolve() for value in (base, local, incoming)]
     if any(location == root or location.is_relative_to(root) or root.is_relative_to(location) for root in roots):
         raise SessionError("Сессия должна находиться отдельно от входных каталогов")
-    expected = [snapshot(root) for root in roots]
     if location.exists():
         raise SessionError(f"Каталог сессии уже существует: {location}")
+    check_storage(location.parent, forbidden_roots=roots)
+    expected = [snapshot(root) for root in roots]
     location.mkdir(parents=True)
     for side, root in zip(("base", "local", "incoming"), roots, strict=True):
         shutil.copytree(root, location / "inputs" / side, ignore=shutil.ignore_patterns(".git"))
@@ -347,7 +356,7 @@ def prepare_directories(
 
 
 def prepare_repository(
-    repository: str | Path, incoming: str, session: str | Path,
+    repository: str | Path, incoming: str, session: str | Path | None = None,
     *, config: Config | None = None, progress: Callable[[dict], None] | None = None,
 ) -> Session:
     from .gitrepo import GitRepository
@@ -360,13 +369,15 @@ def prepare_repository(
         raise AlreadyIntegrated("Входящая версия уже включена в текущую ветку; новая сессия не нужна")
     if len(bases) != 1:
         raise SessionError("Нужно ровно одно подтверждённое основание Git; истории без общего основания или с несколькими основаниями пока не поддержаны")
-    destination = Path(session).resolve()
+    destination = session_location(config, session, label=f"{repo.path.name}-{incoming}")
     repo_root = repo.path
     if destination == repo_root or destination.is_relative_to(repo_root):
         raise SessionError("Сессия Git должна находиться вне исходного репозитория")
     if destination.exists():
         raise SessionError(f"Каталог сессии уже существует: {destination}")
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    check_storage(destination.parent, forbidden_roots=(repo_root,))
+    if progress:
+        progress({"phase": "storage", "session": str(destination), "directory": str(destination.parent)})
     with tempfile.TemporaryDirectory(prefix="merge1c-inputs-", dir=destination.parent) as temporary:
         roots = [Path(temporary) / side for side in ("base", "local", "incoming")]
         for revision, root in zip((bases[0], local_oid, incoming_oid), roots, strict=True):

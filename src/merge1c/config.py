@@ -50,6 +50,7 @@ class Config:
     source_roots: tuple[str, ...] = ()
     platform_version: str = "8.3.27.2342"
     project_root: str = field(default_factory=lambda: str(Path.cwd().resolve()))
+    session_root: str = ""
     git_executable: str = "git"
     git_minimum: str = "2.50.0"
     manual_tool: str = ""
@@ -63,6 +64,7 @@ class Config:
         for name in ("profile", "platform_version", "project_root", "git_executable", "manual_tool"):
             _string(getattr(self, name), name)
         _role(self.incoming_role)
+        _session_root(self.session_root, "storage.session_root")
         _minimum_git(self.git_minimum)
         _boolean(self.require_platform, "require_platform")
         object.__setattr__(self, "source_roots", _roots(self.source_roots))
@@ -84,8 +86,9 @@ class Config:
 
 
 _KEYS = {
-    "": {"schema_version", "project", "git", "resolution", "validation", "tools", "profiles", "xml", "bsl"},
+    "": {"schema_version", "project", "storage", "git", "resolution", "validation", "tools", "profiles", "xml", "bsl"},
     "project": {"source_roots", "platform_version"},
+    "storage": {"session_root"},
     "git": {"executable", "minimum_version", "rename_detection"},
     "resolution": {"manual_tool", "ambiguous"},
     "validation": {"required_tools", "require_platform"},
@@ -116,10 +119,23 @@ def _check_keys(data: dict[str, Any], section: str = "") -> None:
 
 def _read(path: Path) -> dict[str, Any]:
     try:
-        with path.open("rb") as stream:
-            return tomllib.load(stream)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+        source = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
         raise ConfigError(f"Не удалось прочитать {path}: {exc}") from exc
+    try:
+        return tomllib.loads(source)
+    except tomllib.TOMLDecodeError as exc:
+        position = re.search(r"at line (\d+), column (\d+)", str(exc))
+        line = getattr(exc, "lineno", None) or (int(position[1]) if position else None)
+        column = getattr(exc, "colno", None) or (int(position[2]) if position else None)
+        context = ""
+        if line and column and line <= len(source.splitlines()):
+            context = f"\nСтрока {line}, столбец {column}:\n{source.splitlines()[line - 1]}\n{' ' * (column - 1)}^"
+        raise ConfigError(
+            f"Неверный TOML в {path}: {exc}{context}\n"
+            "Пути и текст заключайте в кавычки: source_roots = ['src/cf']; session_root = 'C:/Temp/merge-sessions'. "
+            "Используйте UTF-8; путь Windows с обратными слешами удобно писать в одинарных кавычках."
+        ) from exc
 
 
 def _merge(target: dict[str, Any], extra: dict[str, Any]) -> None:
@@ -146,6 +162,13 @@ def _boolean(value: Any, label: str) -> bool:
     if type(value) is not bool:
         raise ConfigError(f"{label}: ожидается true или false")
     return value
+
+
+def _session_root(value: Any, label: str) -> str:
+    result = _string(value, label)
+    if "\x00" in result or (result and not result.strip()):
+        raise ConfigError(f"{label}: нужен путь или пустая строка для временного каталога пользователя")
+    return result
 
 
 def _role(value: Any) -> str:
@@ -222,6 +245,7 @@ def _profile_overlay(name: str, raw: Any, builtin_role: str) -> tuple[dict[str, 
     # between sections are checked only after applying the selected overlay.
     value_types = {
         "project": {"source_roots": _strings, "platform_version": _string},
+        "storage": {"session_root": _session_root},
         "git": {"executable": _string, "minimum_version": _string, "rename_detection": _string},
         "resolution": {"manual_tool": _string, "ambiguous": _string},
         "validation": {"required_tools": _strings, "require_platform": _boolean},
@@ -262,8 +286,10 @@ def load_config(
     _merge(data, selected)
     if local_path is not None:
         local = _read(Path(local_path))
-        if set(local) - {"tools", "git"}:
-            raise ConfigError("Локальный файл может задавать только tools и git.executable")
+        if set(local) - {"tools", "git", "storage"}:
+            raise ConfigError("Локальный файл может задавать только tools, git.executable и storage.session_root")
+        if "storage" in local and set(_table(local["storage"], "storage")) - {"session_root"}:
+            raise ConfigError("Локальный файл storage задаёт только session_root")
         if "git" in local and set(_table(local["git"], "git")) - {"executable"}:
             raise ConfigError("Локальный файл может изменять только git.executable")
         for name, binding in _table(local.get("tools", {}), "tools").items():
@@ -300,6 +326,7 @@ def load_config(
         source_roots=project.get("source_roots", ()),
         platform_version=_string(project.get("platform_version", "8.3.27.2342"), "project.platform_version"),
         project_root=str(Path(path).resolve().parent if path is not None else Path.cwd().resolve()),
+        session_root=data.get("storage", {}).get("session_root", ""),
         git_executable=_string(git.get("executable", "git"), "git.executable"),
         git_minimum=git.get("minimum_version", "2.50.0"),
         manual_tool=resolution.get("manual_tool", ""),

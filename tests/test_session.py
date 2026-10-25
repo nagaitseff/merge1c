@@ -282,6 +282,18 @@ class RepositorySessionTests(unittest.TestCase):
         self.assertEqual((session.candidate / "local.bin").read_bytes(), b"local")
         self.assertEqual((self.repo / "local.bin").read_bytes(), b"uncommitted work")
 
+    def test_configured_storage_works_when_system_temp_is_unavailable(self) -> None:
+        storage = self.root / "allowed sessions"
+        tool = Tool(executable=sys.executable, args=("-c", "pass"))
+        config = Config(session_root=str(storage), require_platform=False,
+                        required_validators=("check",), tools={"check": tool})
+        with patch("tempfile.gettempdir", side_effect=PermissionError("system temp is unavailable")):
+            session = prepare_repository(self.repo, "vendor", config=config)
+            self.assertEqual(session.path.parent, storage)
+            self.assertTrue(session.check(run_tools=True)["ready"])
+            commit = session.create_branch("candidate/custom-storage")
+        self.assertEqual(self.git("rev-parse", "candidate/custom-storage").decode().strip(), commit)
+
     def test_changed_source_head_prevents_candidate_publication(self) -> None:
         session = prepare_repository(self.repo, "vendor", self.location, config=Config(require_platform=False))
         put(self.repo, "later.bin", b"later")

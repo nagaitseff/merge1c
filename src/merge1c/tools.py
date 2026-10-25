@@ -90,7 +90,7 @@ def run_tool(tool: Tool, values: dict[str, str], *, cwd: Path) -> ToolResult:
     started = time.perf_counter()
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" and tool.kind == "validator" else 0
     try:
-        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        with tempfile.TemporaryFile(dir=cwd) as out, tempfile.TemporaryFile(dir=cwd) as err:
             process = subprocess.run(command, cwd=cwd, shell=False, stdout=out, stderr=err, timeout=tool.timeout, creationflags=flags)
             def tail(stream):
                 stream.seek(0, 2)

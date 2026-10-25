@@ -1,0 +1,7 @@
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+MANIFEST.in text eol=lf
+py.typed text eol=lf

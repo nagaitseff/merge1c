@@ -2,7 +2,6 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 build/
-dist/
 .venv/
 merge1c.local.toml
 .merge1c/

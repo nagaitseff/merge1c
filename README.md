@@ -12,15 +12,27 @@
 
 Нужен Python 3.11 или новее. Для операций с репозиторием нужен Git 2.50 или новее. Обязательных сторонних Python-пакетов нет.
 
-Из каталога проекта:
+Пакет нужно **установить в Python**. Добавление папки проекта в PATH или копирование файлов в Scripts не выполняет установку.
 
-```powershell
-python -m pip install .
-merge1c --version
-merge1c --help
+В примере проект находится в `C:\i-merge\merge1c`. Если вы сохранили его в другом месте, замените путь. Из любого каталога cmd или PowerShell выполните:
+
+```text
+python -m pip install "C:\i-merge\merge1c\dist\merge1c-0.1.1-py3-none-any.whl"
+python -m merge1c --version
+python -m merge1c --help
 ```
 
-Если `merge1c` не находится в PATH, используйте `python -m merge1c` вместо `merge1c`.
+Ожидаемый ответ второй команды: `merge1c 0.1.1`. Используется именно тот Python, который запускается командой `python`. Активировать окружение или менять PATH для вызова `python -m merge1c` не требуется.
+
+Если у вас только исходники без готового `.whl`, установите каталог с `pyproject.toml`:
+
+```text
+python -m pip install "C:\i-merge\merge1c"
+```
+
+После установки можно использовать короткую команду `merge1c`, если каталог с созданным `merge1c.exe` доступен в PATH. Надёжный вариант запуска — `python -m merge1c`. Ошибка `No module named merge1c` означает, что пакет не установлен для выбранного Python; это отдельная проблема от PATH.
+
+Подробные шаги, установка без прав администратора и разбор ошибок — в [инструкции по установке](docs/installation.md).
 
 Проверены Windows PowerShell 5.1, PowerShell 7 и cmd. Команды одинаковы; правила кавычек, коды завершения и особенности перенаправления описаны в [инструкции для Windows](docs/windows.md).
 
@@ -107,6 +119,7 @@ merge1c branch C:/merge-sessions/develop-sync review/develop-sync
 
 ## Документация
 
+- [Установка и ошибки запуска](docs/installation.md)
 - [Порядок работы и восстановление](docs/usage.md)
 - [Настройки и подключение инструментов](docs/configuration.md)
 - [PowerShell и cmd](docs/windows.md)

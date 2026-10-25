@@ -1,0 +1,2 @@
+[console_scripts]
+merge1c = merge1c.cli:main

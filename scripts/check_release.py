@@ -96,6 +96,9 @@ def check_git_workflow(executable: Path, python: Path, git: str, work: Path,
 
     gitrun("config", "user.name", "Release test")
     gitrun("config", "user.email", "release@example.invalid")
+    gitrun("config", "commit.gpgsign", "false")
+    gitrun("config", "core.hooksPath", "")
+    gitrun("config", "core.autocrlf", "false")
     module = repo / "src/cf/CommonModules/Проверка/Ext/Module.bsl"
     module.parent.mkdir(parents=True)
     base = ("Процедура Первая()\n    Значение = 1;\nКонецПроцедуры\n\n"
@@ -103,17 +106,18 @@ def check_git_workflow(executable: Path, python: Path, git: str, work: Path,
     module.write_bytes(base.encode("utf-8"))
     gitrun("add", ".")
     gitrun("commit", "-m", "base")
-    gitrun("branch", "vendor")
+    gitrun("branch", "vendor/2.5.27.101")
+    gitrun("switch", "-c", "update/2.5.27.101")
     module.write_bytes(base.replace("= 1;", "= 10;").encode("utf-8"))
     gitrun("add", ".")
     gitrun("commit", "-m", "local")
     local_head = gitrun("rev-parse", "HEAD").strip()
-    gitrun("checkout", "vendor")
+    gitrun("checkout", "vendor/2.5.27.101")
     module.write_bytes(base.replace("= 2;", "= 20;").encode("utf-8"))
     gitrun("add", ".")
     gitrun("commit", "-m", "vendor")
     incoming = gitrun("rev-parse", "HEAD").strip()
-    gitrun("checkout", "master")
+    gitrun("checkout", "update/2.5.27.101")
     run([executable, "init", repo], work, environment=environment)
     config = repo / "merge1c.toml"
     content = config.read_text(encoding="utf-8")
@@ -128,20 +132,27 @@ def check_git_workflow(executable: Path, python: Path, git: str, work: Path,
     before_index = (repo / ".git/index").read_bytes()
     before_source = module.read_bytes()
     run([executable, "doctor", "--repo", repo, "--storage-only"], work, environment=environment)
-    report = json.loads(run([executable, "prepare", "vendor", "--repo", repo, "--json", "--quiet"],
+    report = json.loads(run([executable, "prepare", "vendor/2.5.27.101", "--repo", repo, "--json", "--quiet"],
                             work, environment=environment))
+    assert report["git"]["local_branch"] == "update/2.5.27.101", report
     session = Path(report["session"])
     checked = json.loads(run([executable, "check", session, "--run-tools", "--json"], work, environment=environment))
     assert checked["ready"], checked
     assert checked["tools"]["python_check"]["status"] == "passed", checked
-    run([executable, "branch", session, "review/release-test"], work, environment=environment)
-    parents = gitrun("rev-list", "--parents", "-1", "review/release-test").split()[1:]
+    output = run([executable, "branch", session, "review/update/2.5.27.101"], work, environment=environment)
+    assert "--ff-only" in output and "update/2.5.27.101" in output, output
+    parents = gitrun("rev-list", "--parents", "-1", "review/update/2.5.27.101").split()[1:]
     assert parents == [local_head, incoming], parents
-    merged = gitrun("show", "review/release-test:" + module.relative_to(repo).as_posix())
+    merged = gitrun("show", "review/update/2.5.27.101:" + module.relative_to(repo).as_posix())
     assert "= 10;" in merged and "= 20;" in merged, merged
     assert gitrun("rev-parse", "HEAD").strip() == local_head
     assert module.read_bytes() == before_source
     assert (repo / ".git/index").read_bytes() == before_index
+    gitrun("merge", "--ff-only", "review/update/2.5.27.101")
+    assert gitrun("rev-parse", "HEAD") == gitrun("rev-parse", "review/update/2.5.27.101")
+    gitrun("merge-base", "--is-ancestor", incoming, "HEAD")
+    assert "= 10;" in module.read_text(encoding="utf-8") and "= 20;" in module.read_text(encoding="utf-8")
+    run([executable, "release-pin", session], work, environment=environment)
     assert run([executable, "--version"], work, environment=environment).strip() == f"merge1c {release}"
 
 

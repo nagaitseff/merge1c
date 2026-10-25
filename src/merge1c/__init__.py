@@ -9,7 +9,7 @@ from .session import AlreadyIntegrated, Session, SessionError, prepare_directori
 from .workspace import StorageError
 from .xmlmerge import inspect_xml, merge_xml
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "AlreadyIntegrated", "Change", "Config", "ConfigError", "DirectoryResult", "GitError", "Issue", "MergeError", "MergeResult",

@@ -77,6 +77,26 @@ class CliTests(unittest.TestCase):
         self.assertEqual(0, code, stderr)
         self.assertRegex(stdout.strip(), r"^merge1c \d+\.\d+\.\d+$")
 
+    def test_human_report_explains_platform_requirement_and_next_step(self):
+        _, session, _, _ = self.prepared()
+        code, stdout, stderr = self.cli("status", session)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("require_platform = true", stdout)
+        self.assertIn("не меняет правила уже созданной сессии", stdout)
+        self.assertIn("python -m merge1c", stdout)
+        self.assertIn("--run-tools", stdout)
+        code, stdout, stderr = self.cli("status", session, "--json")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["session"], str(session))
+
+    def test_hint_does_not_embed_shell_substitution_in_suggested_commands(self):
+        from merge1c.cli import _hint
+
+        self.assertEqual(_hint("status", "C:\\REP\\Сессия с пробелом"), '"status" "C:/REP/Сессия с пробелом"')
+        for unsafe in ("%TEMP%", "$env:TEMP", "`whoami`", "x\";whoami", "x\ny"):
+            with self.subTest(unsafe=unsafe):
+                self.assertIsNone(_hint("status", unsafe))
+
     def test_init_creates_readable_settings_and_never_overwrites_them(self):
         destination = self.root / "new project"
         code, stdout, stderr = self.cli("init", destination)

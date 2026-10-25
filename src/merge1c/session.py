@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime, timezone
 from functools import wraps
@@ -10,7 +11,6 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import shutil
-import tempfile
 import threading
 from typing import Callable
 import uuid
@@ -118,7 +118,7 @@ class Session:
             raise SessionError("Каталог кандидата не может быть символической ссылкой")
 
     def report(self) -> dict:
-        issues = self.data.get("merge_issues", []) + self.data.get("validation_issues", [])
+        issues = self.data.get("merge_issues", []) + self.data.get("validation_issues", []) + self.data.get("persistent_warnings", [])
         try:
             self._verify_sources()
             inputs_current = True
@@ -364,6 +364,7 @@ def prepare_repository(
     config = config or Config()
     repo = GitRepository(repository, executable=config.git_executable, minimum_version=config.git_minimum)
     local_oid, incoming_oid = repo.head(), repo.resolve(incoming)
+    local_branch = repo.current_branch()
     bases = repo.merge_bases(local_oid, incoming_oid)
     if incoming_oid in bases:
         raise AlreadyIntegrated("Входящая версия уже включена в текущую ветку; новая сессия не нужна")
@@ -377,23 +378,44 @@ def prepare_repository(
         raise SessionError(f"Каталог сессии уже существует: {destination}")
     check_storage(destination.parent, forbidden_roots=(repo_root,))
     if progress:
+        progress({"phase": "inputs", "local_branch": local_branch, "local": local_oid, "incoming_ref": incoming,
+                  "incoming": incoming_oid, "base": bases[0]})
         progress({"phase": "storage", "session": str(destination), "directory": str(destination.parent)})
-    with tempfile.TemporaryDirectory(prefix="merge1c-inputs-", dir=destination.parent) as temporary:
-        roots = [Path(temporary) / side for side in ("base", "local", "incoming")]
-        for revision, root in zip((bases[0], local_oid, incoming_oid), roots, strict=True):
-            repo.export_tree(revision, root)
+    cleanup_warnings = []
+
+    def exported(side, event):
+        event = {**event, "side": side}
+        if event["phase"] == "cleanup_warning":
+            cleanup_warnings.append(event)
+        if progress:
+            progress(event)
+
+    with ExitStack() as stack:
+        roots = [stack.enter_context(repo.exported_snapshot(
+            revision, destination.parent, progress=lambda event, side=side: exported(side, event)))
+            for side, revision in zip(("base", "local", "incoming"), (bases[0], local_oid, incoming_oid), strict=True)]
         result = prepare_directories(*roots, destination, config=config, progress=progress)
-    uncommitted_state = bool(repo.status() or repo.operation_in_progress())
-    result.data["git"] = {"repository": str(repo_root), "base": bases[0], "local": local_oid,
-                           "incoming": incoming_oid, "incoming_ref": incoming, "version": repo.version,
-                           "uncommitted_state": uncommitted_state}
-    if uncommitted_state:
-        result.data["validation_issues"].append(asdict(Issue(
-            "git.uncommitted_state", "Использованы только коммиты Git; незакоммиченные файлы и текущие ручные решения не включены", severity="warning")))
-    result.data["origins"] = {"base": bases[0], "local": local_oid, "incoming": incoming_oid}
-    result._save()
-    payload = json.dumps(result.data, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    result.data["git"]["pin"] = repo.pin_session(local_oid, incoming_oid, result.data["id"], payload)
-    result._save()
+        # The session already owns its copies. Save its Git identity and pin
+        # before cleaning up exports, so a locked scratch tree cannot leave a
+        # seemingly successful directory-only session behind.
+        uncommitted_state = bool(repo.status() or repo.operation_in_progress())
+        result.data["git"] = {"repository": str(repo_root), "base": bases[0], "local": local_oid,
+                              "local_branch": local_branch,
+                              "incoming": incoming_oid, "incoming_ref": incoming, "version": repo.version,
+                              "uncommitted_state": uncommitted_state}
+        if uncommitted_state:
+            result.data["validation_issues"].append(asdict(Issue(
+                "git.uncommitted_state", "Использованы только коммиты Git; незакоммиченные файлы и текущие ручные решения не включены", severity="warning")))
+        result.data["origins"] = {"base": bases[0], "local": local_oid, "incoming": incoming_oid}
+        result._save()
+        payload = json.dumps(result.data, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        result.data["git"]["pin"] = repo.pin_session(local_oid, incoming_oid, result.data["id"], payload)
+        result._save()
+    for event in cleanup_warnings:
+        message = f"Временный экспорт не удалось удалить: {event['directory']}. {event['message']}. Сессия сохранена; удалите только этот временный каталог после освобождения файлов"
+        result.data.setdefault("persistent_warnings", []).append(asdict(Issue("storage.cleanup", message, severity="warning")))
+        result.event("cleanup_warning", directory=event["directory"], message=event["message"])
+    if cleanup_warnings:
+        result._save()
     return result
 

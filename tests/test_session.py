@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -293,6 +295,64 @@ class RepositorySessionTests(unittest.TestCase):
             self.assertTrue(session.check(run_tools=True)["ready"])
             commit = session.create_branch("candidate/custom-storage")
         self.assertEqual(self.git("rev-parse", "candidate/custom-storage").decode().strip(), commit)
+
+    def test_prepare_uses_private_snapshots_without_publishing_directory_renames(self) -> None:
+        events = []
+        with patch.object(GitRepository, "export_tree", side_effect=AssertionError("No public export needed")):
+            session = prepare_repository(self.repo, "vendor", self.location,
+                                         config=Config(require_platform=False), progress=events.append)
+        self.assertTrue(session.report()["ready"])
+        self.assertEqual(session.data["git"]["local_branch"], "main")
+        exported = [event for event in events if event["phase"] == "export"]
+        self.assertEqual({event["side"] for event in exported}, {"base", "local", "incoming"})
+        self.assertTrue(all(0 <= event["current"] <= event["total"] for event in exported))
+
+    @unittest.skipUnless(os.name == "nt", "Windows delete-sharing semantics")
+    def test_prepare_completes_while_exported_child_file_blocks_directory_rename(self) -> None:
+        from tests.test_gitrepo import _file_without_delete_share
+
+        original = GitRepository.exported_snapshot
+        reproduced = []
+
+        @contextmanager
+        def locked(repo, revision, parent, *, progress=None):
+            with original(repo, revision, parent, progress=progress) as root:
+                child = root / "vendor.bin"
+                if revision == self.incoming:
+                    with _file_without_delete_share(child):
+                        with self.assertRaises(PermissionError) as caught:
+                            root.rename(root.with_name("would-fail-in-0.1.2"))
+                        self.assertEqual(caught.exception.winerror, 5)
+                        reproduced.append(root)
+                        yield root
+                else:
+                    yield root
+
+        with patch.object(GitRepository, "exported_snapshot", locked):
+            session = prepare_repository(self.repo, "vendor", self.location, config=Config(require_platform=False))
+        self.assertEqual(len(reproduced), 1)
+        self.assertTrue(session.report()["ready"])
+        self.assertEqual((session.candidate / "vendor.bin").read_bytes(), b"vendor")
+        self.assertIn("pin", session.data["git"])
+
+    def test_cleanup_warning_preserves_a_pinned_git_session_and_survives_check(self) -> None:
+        original = GitRepository.exported_snapshot
+
+        @contextmanager
+        def warning(repo, revision, parent, *, progress=None):
+            with original(repo, revision, parent, progress=progress) as root:
+                yield root
+                saved = Session(self.location)
+                self.assertIn("pin", saved.data["git"])
+                progress({"phase": "cleanup_warning", "directory": str(root), "message": "locked by test"})
+
+        with patch.object(GitRepository, "exported_snapshot", warning):
+            session = prepare_repository(self.repo, "vendor", self.location, config=Config(require_platform=False))
+        report = Session(session.path).check()
+        self.assertTrue(report["ready"], report)
+        self.assertIn("storage.cleanup", {issue["code"] for issue in report["issues"]})
+        commit = session.create_branch("review/cleanup-warning")
+        self.assertEqual(self.git("rev-parse", "review/cleanup-warning").decode().strip(), commit)
 
     def test_changed_source_head_prevents_candidate_publication(self) -> None:
         session = prepare_repository(self.repo, "vendor", self.location, config=Config(require_platform=False))

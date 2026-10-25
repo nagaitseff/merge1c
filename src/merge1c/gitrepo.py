@@ -6,6 +6,7 @@ configuration.  The only publication operation creates a new candidate branch.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from hashlib import sha256
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -13,7 +14,10 @@ import re
 import shutil
 import subprocess
 import tempfile
-from typing import Any
+import time
+from typing import Any, Callable
+import uuid
+import warnings
 
 from .processes import find_program
 
@@ -27,6 +31,59 @@ _REPOSITORY_ENV = (
     "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX",
 )
+_WINDOWS_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.0)
+
+
+def _windows_lock_error(error: OSError) -> bool:
+    return os.name == "nt" and getattr(error, "winerror", None) in {5, 32, 33}
+
+
+def _retry_windows_lock(action) -> None:
+    for delay in (*_WINDOWS_RETRY_DELAYS, None):
+        try:
+            action()
+            return
+        except OSError as exc:
+            if delay is None or not _windows_lock_error(exc):
+                raise
+            time.sleep(delay)
+
+
+@contextmanager
+def _export_directory(parent: Path, progress: Callable[[dict], None] | None = None):
+    """Own a private directory without tempfile's Windows permission retries."""
+    _check_link_ancestors(parent)
+    parent.mkdir(parents=True, exist_ok=True)
+    directory = parent / f".merge1c-export-{uuid.uuid4().hex}"
+    directory.mkdir(mode=0o700)
+    failure = None
+    try:
+        yield directory
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        def remove():
+            _check_link_ancestors(directory)
+            if directory.exists():
+                shutil.rmtree(directory)
+
+        try:
+            _retry_windows_lock(remove)
+        except (OSError, GitError) as exc:
+            message = f"Не удалось удалить временную выгрузку {directory}: {exc}. Каталог оставлен для последующего удаления"
+            if failure is not None:
+                failure.add_note(message)
+            if progress:
+                try:
+                    progress({"phase": "cleanup_warning", "directory": str(directory), "message": message})
+                except Exception as notification_error:
+                    if failure is not None:
+                        failure.add_note(f"Не удалось сообщить об очистке: {notification_error}")
+                    else:
+                        warnings.warn(message, RuntimeWarning, stacklevel=2)
+            elif failure is None:
+                warnings.warn(message, RuntimeWarning, stacklevel=2)
 
 
 def _decode(value: bytes) -> str:
@@ -157,6 +214,10 @@ class GitRepository:
     def head(self) -> str:
         return self.resolve("HEAD")
 
+    def current_branch(self) -> str | None:
+        result = self._run(["symbolic-ref", "--quiet", "--short", "HEAD"], allowed=(0, 1))
+        return _decode(result.stdout).strip() if result.returncode == 0 else None
+
     def status(self) -> str:
         """Return NUL-delimited porcelain status for tracked files only."""
         return _decode(self._run([
@@ -203,23 +264,24 @@ class GitRepository:
             entries.append((mode, oid, name))
         return entries
 
-    def export_tree(self, revision: str, destination: str | os.PathLike[str]) -> None:
-        """Stream raw blobs, deliberately bypassing archive attributes/filters.
-
-        Export-ignore and export-subst must never omit or alter source files.
-        Symbolic links and gitlinks are explicitly unsupported in this MVP.
-        """
-        commit = self.resolve(revision)
-        entries = self._tree_entries(commit)
-        requested = Path(destination)
-        target = requested.absolute()
-        _check_link_ancestors(target)
-        if target.exists() and (not target.is_dir() or any(target.iterdir())):
-            raise GitError("Export destination must be absent or an empty directory")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        stage = Path(tempfile.mkdtemp(prefix=".merge1c-export-", dir=target.parent))
+    def _write_tree(
+        self, entries: list[tuple[str, str, str]], target: Path,
+        progress: Callable[[dict], None] | None = None,
+    ) -> None:
+        """Write exact Git blobs into a new private directory, without publishing it."""
         process = None
+        written = reported_bytes = reported_files = 0
+        current, last_path = 0, ""
+
+        def emit(current: int, path: str, *, force: bool = False, complete: bool = False):
+            nonlocal reported_bytes, reported_files
+            if progress and (force or current - reported_files >= 100 or written - reported_bytes >= 8 * 1024 * 1024):
+                progress({"phase": "export", "current": current, "total": len(entries),
+                          "bytes": written, "path": path, "complete": complete})
+                reported_bytes, reported_files = written, current
+
         try:
+            emit(0, "", force=True)
             with tempfile.TemporaryFile(dir=target.parent) as errors:
                 try:
                     process = subprocess.Popen(
@@ -229,14 +291,14 @@ class GitRepository:
                 except OSError as exc:
                     raise GitError("Cannot execute Git: %s" % exc) from exc
                 assert process.stdin is not None and process.stdout is not None
-                for mode, oid, name in entries:
+                for current, (mode, oid, name) in enumerate(entries, 1):
                     process.stdin.write(oid.encode("ascii") + b"\n")
                     process.stdin.flush()
                     header = process.stdout.readline().split()
                     if len(header) != 3 or header[:2] != [oid.encode("ascii"), b"blob"]:
                         raise GitError("Invalid Git blob response for %s" % name)
                     remaining = int(header[2])
-                    output = stage / _relative_path(name)
+                    output = target / _relative_path(name)
                     output.parent.mkdir(parents=True, exist_ok=True)
                     with output.open("xb") as stream:
                         while remaining:
@@ -245,29 +307,21 @@ class GitRepository:
                                 raise GitError("Truncated Git blob: %s" % name)
                             stream.write(chunk)
                             remaining -= len(chunk)
+                            written += len(chunk)
+                            emit(current - 1, name)
                     if process.stdout.read(1) != b"\n":
                         raise GitError("Malformed Git blob terminator: %s" % name)
                     if os.name != "nt":
                         output.chmod(0o755 if mode == "100755" else 0o644)
+                    last_path = name
+                    emit(current, name)
                 process.stdin.close()
                 process.stdout.close()
                 returncode = process.wait()
                 if returncode:
                     errors.seek(0)
                     raise GitError("git cat-file failed (%d): %s" % (returncode, _decode(errors.read())))
-            # Recheck so that concurrent destination edits cannot be overwritten.
-            _check_link_ancestors(target)
-            if target.exists():
-                if not target.is_dir() or any(target.iterdir()):
-                    raise GitError("Export destination changed during export")
-                target.rmdir()
-            stage.rename(target)
-        except (OSError, ValueError) as exc:
-            raise GitError(
-                "Не удалось выгрузить снимок Git в %s: %s. "
-                "Проверьте права на создание, переименование и удаление каталогов, а также блокировку файлов. "
-                "Другой рабочий каталог задаётся через storage.session_root или --session" % (target, exc)
-            ) from exc
+            emit(current, last_path, force=True, complete=True)
         finally:
             if process is not None:
                 if process.poll() is None:
@@ -277,8 +331,53 @@ class GitRepository:
                     process.stdin.close()
                 if process.stdout is not None and not process.stdout.closed:
                     process.stdout.close()
-            if stage.exists():
-                shutil.rmtree(stage)
+
+    @contextmanager
+    def exported_snapshot(
+        self, revision: str, parent: str | os.PathLike[str],
+        *, progress: Callable[[dict], None] | None = None,
+    ):
+        """Yield a complete private snapshot, then remove it after use.
+
+        There is no final directory rename: a temporary reader of an exported
+        XML file must not prevent prepare from using the completed snapshot.
+        """
+        commit = self.resolve(revision)
+        entries = self._tree_entries(commit)
+        with _export_directory(Path(parent).absolute(), progress) as directory:
+            try:
+                self._write_tree(entries, directory, progress)
+            except (OSError, ValueError) as exc:
+                raise GitError(
+                    "Не удалось выгрузить снимок Git в %s: %s. "
+                    "Проверьте доступ к файлам или задайте другой storage.session_root" % (directory, exc)
+                ) from exc
+            yield directory
+
+    def export_tree(self, revision: str, destination: str | os.PathLike[str]) -> None:
+        """Atomically publish raw blobs, bypassing archive attributes and filters."""
+        target = Path(destination).absolute()
+        _check_link_ancestors(target)
+        if target.exists() and (not target.is_dir() or any(target.iterdir())):
+            raise GitError("Export destination must be absent or an empty directory")
+        try:
+            with self.exported_snapshot(revision, target.parent) as stage:
+                def publish():
+                    # Recheck on every retry: a new destination must not be overwritten.
+                    _check_link_ancestors(target)
+                    if target.exists():
+                        if not target.is_dir() or any(target.iterdir()):
+                            raise GitError("Export destination changed during export")
+                        target.rmdir()
+                    stage.rename(target)
+
+                _retry_windows_lock(publish)
+        except (OSError, ValueError) as exc:
+            raise GitError(
+                "Не удалось выгрузить снимок Git в %s: %s. "
+                "Проверьте права на создание, переименование и удаление каталогов, а также блокировку файлов. "
+                "Другой рабочий каталог задаётся через storage.session_root или --session" % (target, exc)
+            ) from exc
 
     def preview(self, local: str, incoming: str) -> dict[str, Any]:
         left, right = self.resolve(local), self.resolve(incoming)

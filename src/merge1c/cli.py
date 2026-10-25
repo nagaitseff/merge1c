@@ -51,13 +51,20 @@ def _progress(json_lines: bool):
             print(json.dumps(event, ensure_ascii=True), file=sys.stderr, flush=True)
             return
         phase = event["phase"]
-        if phase == "merge":
+        if phase == "inputs":
+            print(f"Наша ветка: {event.get('local_branch') or event['local']}; входящая: {event['incoming_ref']}", file=sys.stderr, flush=True)
+        elif phase == "export":
+            side = {"base": "общее основание", "local": "наша ветка", "incoming": "входящая ветка"}.get(event.get("side"), "снимок")
+            print(f"Выгрузка Git — {side}: {event['current']}/{event['total']} файлов, {event['bytes'] / (1024 * 1024):.1f} МиБ", file=sys.stderr, flush=True)
+        elif phase == "cleanup_warning":
+            print(f"Предупреждение: временный каталог остался занят: {event['directory']}", file=sys.stderr, flush=True)
+        elif phase == "merge":
             current, total = event["current"], event["total"]
             if current == 1 or current == total or current % 100 == 0:
                 print(f"Объединение: {current}/{total} — {event['path']}", file=sys.stderr, flush=True)
         elif phase != last_phase:
             if phase == "storage":
-                print(f"Каталог сессии: {event['session']}", file=sys.stderr, flush=True)
+                print(f"Сессия будет создана: {event['session']}", file=sys.stderr, flush=True)
                 last_phase = phase
                 return
             message = {"scan": "Чтение исходников", "validate": "Проверка результата", "complete": "Кандидат подготовлен"}.get(phase, phase)
@@ -87,6 +94,41 @@ def _show(report: dict, json_output: bool) -> None:
             print(f"  Инструмент {name}: {result['status']} — {result.get('stderr', '')[-1000:]}")
     if report.get("stale_tools"):
         print("Изменились проверяющие программы; повторите check --run-tools: " + ", ".join(report["stale_tools"]))
+
+
+def _hint(*arguments: str) -> str | None:
+    # Hints are for pasting in cmd or PowerShell. Do not turn unusual file or
+    # branch names into shell substitutions in either shell.
+    values = [str(value).replace("\\", "/") for value in arguments]
+    if any(re.search(r'["%$`!\r\n]', value) for value in values):
+        return None
+    return " ".join('"' + value + '"' for value in values)
+
+
+def _next_steps(session: Session, report: dict) -> None:
+    git = report.get("git")
+    if git:
+        print(f"Наша ветка: {git.get('local_branch') or git['local']}; входящая: {git['incoming_ref']}")
+        print("Результат пока в candidate. Исходная ветка и её рабочие файлы не изменены.")
+    if session.config.require_platform and report["platform"] != "passed":
+        print("До создания ветки требуется проверка 1С настроенным адаптером (require_platform = true).")
+        print("Ручной порядок проверки описан в docs/guide.md. Изменение TOML не меняет правила уже созданной сессии.")
+    if report["ready"]:
+        if report["platform"] != "passed":
+            print("Встроенные проверки пройдены; 1С библиотекой не запускалась. Проверьте кандидат в тестовой базе.")
+        if git:
+            name = "review/" + (git.get("local_branch") or session.data["id"][:8])
+            command = _hint("branch", str(session.path), name)
+            if command:
+                print("После проверки сохраните результат в новой ветке:")
+                print("  python -m merge1c " + command)
+    else:
+        command = _hint("status" if report["status"] == "conflicts" else "check", str(session.path))
+        if command:
+            print("Продолжить работу с этой сессией:")
+            print("  python -m merge1c " + command + (" --run-tools" if report["status"] != "conflicts" else ""))
+        if report["status"] == "conflicts":
+            print("Исправляйте указанные файлы в candidate; для нерешённого файла используйте resolve --tool beyond_compare или подтвердите ручную правку через resolve --accept.")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -262,11 +304,15 @@ def main(argv: list[str] | None = None) -> int:
                 session = prepare_repository(arguments.repo, arguments.incoming, arguments.session, config=config, progress=progress)
             report = session.report()
             _show(report, arguments.json)
+            if not arguments.json:
+                _next_steps(session, report)
             return int(report["status"] == "conflicts")
         session = Session(arguments.session)
         if arguments.command in {"status", "check"}:
             report = session.check(run_tools=arguments.command == "check" and arguments.run_tools)
             _show(report, arguments.json)
+            if not arguments.json:
+                _next_steps(session, report)
             return (0 if report["ready"] else 1 if report["status"] == "conflicts" else 2) if arguments.command == "check" else 0
         if arguments.command == "resolve":
             tool_name = (arguments.tool or session.config.manual_tool) if arguments.tool is not None else None
@@ -279,6 +325,13 @@ def main(argv: list[str] | None = None) -> int:
             oid = session.create_branch(arguments.name, message=arguments.message)
             print(f"Создана ветка {arguments.name}: {oid}")
             print("Исходная ветка и рабочие файлы не изменены.")
+            git = session.data.get("git") or {}
+            if git.get("local_branch"):
+                print(f"После проверки включите результат в {git['local_branch']}. Сначала убедитесь, что именно эта ветка выбрана:")
+                for arguments_to_git in (("switch", git["local_branch"]), ("merge", "--ff-only", arguments.name)):
+                    command = _hint("-C", git["repository"], *arguments_to_git)
+                    if command:
+                        print("  git " + command)
             return 0
         if arguments.command == "release-pin":
             session.release_pin()

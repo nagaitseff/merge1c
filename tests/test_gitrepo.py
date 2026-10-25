@@ -1,15 +1,44 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 from hashlib import sha256
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import uuid
 
-from merge1c.gitrepo import GitError, GitRepository, _relative_path
+from merge1c.gitrepo import GitError, GitRepository, _relative_path, _WINDOWS_RETRY_DELAYS
+
+
+def _locked_error():
+    error = PermissionError("temporary Windows lock")
+    error.winerror = 5
+    return error
+
+
+@contextmanager
+def _file_without_delete_share(path: Path):
+    """An ordinary Windows reader can prevent renaming the containing tree."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    # GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING.
+    handle = kernel.CreateFileW(str(path), 0x80000000, 3, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        yield
+    finally:
+        kernel.CloseHandle(handle)
 
 
 class GitRepositoryTests(unittest.TestCase):
@@ -69,6 +98,13 @@ class GitRepositoryTests(unittest.TestCase):
         self.assertEqual(self.repo.merge_bases(local, incoming), [self.base])
         with self.assertRaises(GitError):
             self.repo.resolve("--help")
+
+    def test_current_branch_reports_name_or_detached_head(self) -> None:
+        self.assertEqual(self.repo.current_branch(), "main")
+        before = self.repo.head()
+        self.git("checkout", "-q", "--detach", "HEAD")
+        self.assertIsNone(self.repo.current_branch())
+        self.assertEqual(self.repo.head(), before)
 
     def test_status_is_read_only_and_ignores_untracked_files(self) -> None:
         index = (self.path / ".git" / "index").read_bytes()
@@ -169,6 +205,149 @@ class GitRepositoryTests(unittest.TestCase):
         self.assertEqual((destination / "subst.txt").read_bytes(), b"$Format:%H$\n")
         self.assertEqual((destination / "Каталог с пробелом/Модуль.bsl").read_bytes(), raw)
 
+    def test_private_snapshot_is_complete_without_any_final_rename(self) -> None:
+        root = Path(self.temporary.name) / "private snapshots"
+        with patch.object(Path, "rename", side_effect=AssertionError("snapshot must not rename")):
+            with self.repo.exported_snapshot("HEAD", root) as snapshot:
+                self.assertEqual((snapshot / "common.txt").read_bytes(), b"base\n")
+                self.assertEqual(snapshot.parent, root)
+        self.assertFalse(snapshot.exists())
+
+    def test_private_snapshot_failure_never_yields_partial_tree(self) -> None:
+        root = Path(self.temporary.name) / "private snapshots"
+        with patch.object(self.repo, "_write_tree", side_effect=OSError("write failed")):
+            with self.assertRaisesRegex(GitError, "write failed"):
+                with self.repo.exported_snapshot("HEAD", root):
+                    self.fail("a partial tree must never be exposed")
+        self.assertEqual(list(root.iterdir()), [])
+
+    def test_snapshot_progress_is_bounded_and_counts_exact_raw_bytes(self) -> None:
+        self.write("a-large.bin", b"\x00" * (9 * 1024 * 1024))
+        for number in range(205):
+            self.write(f"files/{number:03}.txt", b"small\n")
+        self.commit("export progress")
+        events = []
+        root = Path(self.temporary.name) / "private snapshots"
+        with self.repo.exported_snapshot("HEAD", root, progress=events.append) as snapshot:
+            files = [path for path in snapshot.rglob("*") if path.is_file()]
+            self.assertEqual(events[-1]["bytes"], sum(path.stat().st_size for path in files))
+            self.assertEqual(events[-1]["current"], len(files))
+        self.assertEqual(events[0]["current"], 0)
+        self.assertEqual(events[0]["bytes"], 0)
+        self.assertTrue(events[-1]["complete"])
+        self.assertTrue(all(event["phase"] == "export" for event in events))
+        self.assertTrue(all(event["total"] == len(files) for event in events))
+        self.assertTrue(all(left["bytes"] <= right["bytes"] for left, right in zip(events, events[1:], strict=False)))
+        self.assertGreaterEqual(len(events), 4)
+        self.assertLessEqual(len(events), 7)
+
+    def test_public_export_retries_only_bounded_windows_locks(self) -> None:
+        root = Path(self.temporary.name)
+        destination = root / "retry export"
+        with patch.object(Path, "rename", side_effect=_locked_error()) as rename:
+            with patch("merge1c.gitrepo._windows_lock_error", return_value=True):
+                with patch("merge1c.gitrepo.time.sleep") as sleep:
+                    with self.assertRaisesRegex(GitError, "temporary Windows lock"):
+                        self.repo.export_tree("HEAD", destination)
+        self.assertEqual(rename.call_count, len(_WINDOWS_RETRY_DELAYS) + 1)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], list(_WINDOWS_RETRY_DELAYS))
+        self.assertFalse(destination.exists())
+        self.assertFalse(list(root.glob(".merge1c-export-*")))
+
+    def test_public_export_does_not_retry_other_errors(self) -> None:
+        destination = Path(self.temporary.name) / "failed export"
+        with patch.object(Path, "rename", side_effect=OSError("different error")) as rename:
+            with patch("merge1c.gitrepo.time.sleep") as sleep:
+                with self.assertRaisesRegex(GitError, "different error"):
+                    self.repo.export_tree("HEAD", destination)
+        self.assertEqual(rename.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_public_export_rechecks_destination_after_waiting(self) -> None:
+        destination = Path(self.temporary.name) / "racing export"
+
+        def concurrent_edit(delay):
+            destination.mkdir()
+            (destination / "new.txt").write_bytes(b"keep")
+
+        with patch.object(Path, "rename", side_effect=_locked_error()) as rename:
+            with patch("merge1c.gitrepo._windows_lock_error", return_value=True):
+                with patch("merge1c.gitrepo.time.sleep", side_effect=concurrent_edit):
+                    with self.assertRaisesRegex(GitError, "changed during export"):
+                        self.repo.export_tree("HEAD", destination)
+        self.assertEqual(rename.call_count, 1)
+        self.assertEqual((destination / "new.txt").read_bytes(), b"keep")
+
+    def test_cleanup_failure_reports_remaining_directory_without_losing_snapshot(self) -> None:
+        events = []
+        root = Path(self.temporary.name) / "private snapshots"
+        with patch("merge1c.gitrepo.shutil.rmtree", side_effect=_locked_error()) as remove:
+            with patch("merge1c.gitrepo._windows_lock_error", return_value=True):
+                with patch("merge1c.gitrepo.time.sleep"):
+                    with self.repo.exported_snapshot("HEAD", root, progress=events.append) as snapshot:
+                        self.assertEqual((snapshot / "common.txt").read_bytes(), b"base\n")
+        self.assertEqual(remove.call_count, len(_WINDOWS_RETRY_DELAYS) + 1)
+        self.assertTrue(snapshot.exists())
+        self.assertEqual(events[-1]["phase"], "cleanup_warning")
+        self.assertEqual(events[-1]["directory"], str(snapshot))
+        self.assertIn(str(snapshot), events[-1]["message"])
+
+    def test_cleanup_failure_does_not_mask_a_body_error(self) -> None:
+        failure = ValueError("body failed")
+        events = []
+        root = Path(self.temporary.name) / "private snapshots"
+        with patch("merge1c.gitrepo.shutil.rmtree", side_effect=_locked_error()):
+            with patch("merge1c.gitrepo._windows_lock_error", return_value=True):
+                with patch("merge1c.gitrepo.time.sleep"):
+                    with self.assertRaises(ValueError) as caught:
+                        with self.repo.exported_snapshot("HEAD", root, progress=events.append) as snapshot:
+                            raise failure
+        self.assertIs(caught.exception, failure)
+        self.assertTrue(any(str(snapshot) in note for note in failure.__notes__))
+        self.assertEqual(events[-1]["phase"], "cleanup_warning")
+
+    @unittest.skipUnless(os.name == "nt", "Windows delete-sharing semantics")
+    def test_private_snapshot_can_be_read_with_a_real_child_handle_lock(self) -> None:
+        root = Path(self.temporary.name) / "private snapshots"
+        with self.repo.exported_snapshot("HEAD", root) as snapshot:
+            with _file_without_delete_share(snapshot / "common.txt"):
+                self.assertEqual((snapshot / "common.txt").read_bytes(), b"base\n")
+                with self.assertRaises(PermissionError) as caught:
+                    snapshot.rename(root / "renamed")
+                self.assertEqual(caught.exception.winerror, 5)
+        self.assertFalse(snapshot.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows delete-sharing semantics")
+    def test_public_export_recovers_when_real_child_lock_is_released(self) -> None:
+        destination = Path(self.temporary.name) / "locked export"
+        original = Path.rename
+        lock_context = None
+        release = None
+        attempts = []
+
+        def rename(source, target):
+            nonlocal lock_context, release
+            attempts.append(source)
+            if lock_context is None:
+                lock_context = _file_without_delete_share(source / "common.txt")
+                lock_context.__enter__()
+            try:
+                return original(source, target)
+            except PermissionError:
+                if release is None:
+                    release = threading.Timer(0.1, lock_context.__exit__, args=(None, None, None))
+                    release.start()
+                raise
+
+        try:
+            with patch.object(Path, "rename", rename):
+                self.repo.export_tree("HEAD", destination)
+        finally:
+            if release is not None:
+                release.join()
+        self.assertGreaterEqual(len(attempts), 2)
+        self.assertEqual((destination / "common.txt").read_bytes(), b"base\n")
+
     def test_export_refuses_existing_files_and_symlink_tree(self) -> None:
         destination = Path(self.temporary.name) / "existing"
         destination.mkdir()
@@ -181,6 +360,9 @@ class GitRepositoryTests(unittest.TestCase):
         self.git("commit", "-q", "-m", "symlink tree")
         with self.assertRaisesRegex(GitError, "symbolic link"):
             self.repo.export_tree("HEAD", Path(self.temporary.name) / "unsafe")
+        with self.assertRaisesRegex(GitError, "symbolic link"):
+            with self.repo.exported_snapshot("HEAD", Path(self.temporary.name) / "unsafe-private"):
+                self.fail("a symlink tree must not be exposed")
         self.assertFalse((Path(self.temporary.name) / "outside").exists())
 
     def test_path_guard_rejects_traversal_and_git_metadata(self) -> None:
